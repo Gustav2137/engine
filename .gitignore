@@ -1,3 +1,6 @@
+./.ccls
+./.vimspector.json
 thc.h
 thc.cpp
 *.o
+*.txt
