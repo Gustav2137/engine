@@ -3,6 +3,6 @@ thc:
 thcg:
 	g++ thc.cpp -c -o thc.o -g
 release: thc
-	g++ engine.cpp thc.o -O3
+	g++ engine.cpp thc.o -O3 -o engine
 debug: thcg
-	g++ engine.cpp thc.o -g
+	g++ engine.cpp thc.o -g -o engine
