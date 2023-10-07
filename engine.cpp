@@ -20,9 +20,9 @@
 // }}}
 
 #define debug 0
-#define VERBOSE 0
+#define VERBOSE 1
 #define HEUR 0
-#define T_MOVE 0
+#define HIT_CONFIRMATION 0
 
 using namespace std;
 // {{{ TEMPLATE
@@ -136,13 +136,27 @@ public:
 // ----------------------------------------------
 // }}}
 
-#define DEPTH 5
+int DEPTH = 6;
 #define SORTED DEPTH / 2 + 1
 
-int n = 1000;
+const double mate_score = 1e10;
+
+chrono::time_point<chrono::system_clock> start;
+chrono::milliseconds per_move;
 
 typedef optional<thc::Move> Move;
 typedef vector<thc::Move> Moves;
+
+enum Node_type { Exact, Upper, Lower };
+
+struct TT_node {
+  Move best_move;
+  double value;
+  int depth;
+  Node_type type;
+  int history = 0;
+};
+unordered_map<uint64_t, TT_node> TT;
 
 class Game {
 public:
@@ -160,19 +174,32 @@ public:
   void gen_moves(vector<thc::Move> &moves, vb &check, vb &mate, vb &stalemate) {
     board.GenLegalMoveList(moves, check, mate, stalemate);
   }
-  Game apply_move(const Move &m) const {
-    Game after(*this);
+  void apply_move_no_undo(Move m) {
     if (m) {
-      after.board.PlayMove(m.value());
+      board.PlayMove(m.value());
     } else {
       throw runtime_error("null move in chess???");
     }
-    return after;
+  }
+  uint64_t Hash_roll(Move m, uint64_t oldhash) {
+    return board.Hash64Update(oldhash, m.value());
+  }
+  uint64_t Hash() { return board.Hash64Calculate(); }
+  void apply_move(Move m) {
+    if (m) {
+      board.PushMove(m.value());
+    } else {
+      throw runtime_error("null move in chess???");
+    }
   }
   thc::TERMINAL terminal() {
     thc::TERMINAL res;
     board.Evaluate(res);
     return res;
+  }
+  void undo_move(Move m) {
+    if (m)
+      board.PopMove(m.value());
   }
   double heuristic() {
     // material count
@@ -208,7 +235,6 @@ public:
     board.GenLegalMoveList(m[0], checks, ma, st);
     double W_mate =
         accumulate(ma.begin(), ma.end(), 0) * (board.WhiteToPlay() ? 1e6 : 0);
-    board.GenLegalMoveList(m[0], checks, ma, st);
     double W_checks = accumulate(checks.begin(), checks.end(), 0) + W_mate;
     double B_checks;
     checks.clear();
@@ -216,10 +242,10 @@ public:
     st.clear();
     {
       thc::ChessRules other = board;
-      other.Transform();
+      other.Toggle();
       other.GenLegalMoveList(m[1], checks, ma, st);
       double B_mate = accumulate(ma.begin(), ma.end(), 0) *
-                      (!board.WhiteToPlay() ? 1e6 : 0);
+                      (!board.WhiteToPlay() ? 1e3 : 0);
       B_checks = accumulate(checks.begin(), checks.end(), 0) + B_mate;
       checks.clear();
       ma.clear();
@@ -447,14 +473,16 @@ public:
       B_space += board.AttackedSquare(static_cast<thc::Square>(s), false);
     }
     double space = W_space - B_space;
+    double sum = 5.6 * material + 0.1 * king_value + 0.1 * mobility +
+                 0.5 * pawn_value + 0.5 * space + 1.0 * activity;
 #if HEUR
     print();
     cout << "material: " << material << "\nking_value: " << king_value
          << "\nmobility: " << mobility << "\npawn_value: " << pawn_value
-         << "\nspace: " << space << "\nactivity: " << activity << "\n";
+         << "\nspace: " << space << "\nactivity: " << activity << "\n"
+         << "------\nsum: " << sum;
 #endif
-    return 3.0 * material + 0.1 * king_value + 0.1 * mobility +
-           0.5 * pawn_value + 0.5 * space + 1.0 * activity;
+    return sum;
   }
 };
 
@@ -464,35 +492,57 @@ inline double heuristic_terminal(const thc::TERMINAL &a) {
     throw runtime_error("should only be called when pos terminal");
     break;
   case thc::TERMINAL_WCHECKMATE:
-    return -INFINITY;
+    return -mate_score;
     break;
   case thc::TERMINAL_BCHECKMATE:
-    return INFINITY;
+    return mate_score;
     break;
   default:
     return 0;
   }
 }
 
-double heur_wrapper(const Game &state, thc::Move m, bool check, bool mate,
-                    bool stalemate) {
+double heur_wrapper(Game &state, thc::Move m, bool check, bool mate,
+                    bool stalemate, uint64_t Hash) {
   if (mate) {
-    return INFINITY;
+    return mate_score * (state.board.WhiteToPlay() ? 1.0 : -1.0);
   }
   if (stalemate) {
     return 0;
   }
-  return state.apply_move(m).heuristic() * (check ? 1000 : 1);
+  uint64_t new_hash = state.Hash_roll(m, Hash);
+  auto it = TT.find(new_hash);
+  if (it != TT.end()) {
+    return it->sc.value * (check ? 1000 : 1);
+  }
+  state.apply_move(m);
+  double h = state.heuristic() * (check ? 1000 : 1);
+  state.undo_move(m);
+  return h;
 }
 
-pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
-                              double beta, bool maxi) {
+pair<Move, double> alpha_beta(Game &state, Move a, int depth, double alpha,
+                              double beta, bool maxi, uint64_t Hash) {
+  thc::TERMINAL result = state.terminal();
+  if (result != thc::NOT_TERMINAL) {
+    return {{}, (depth + 1) * heuristic_terminal(result)};
+  }
+  auto memory = TT.find(Hash);
+  if (memory != TT.end() and memory->sc.depth >= depth) {
+#if HIT_CONFIRMATION
+    cout << "Hit! Best Move: " << memory->sc.best_move->NaturalOut(&state.board)
+         << " " << memory->sc.best_move->TerseOut()
+         << "\nValue: " << memory->sc.value << "\nPosition: \n";
+    state.print();
+#endif
+    return {memory->sc.best_move, memory->sc.value};
+  }
   if (depth == 0) {
     return {a, state.heuristic()};
   }
-  thc::TERMINAL result = state.terminal();
-  if (result != thc::NOT_TERMINAL) {
-    return {{}, heuristic_terminal(result)};
+  auto T = chrono::system_clock::now();
+  if (chrono::duration_cast<chrono::milliseconds>(T - start) > per_move) {
+    throw runtime_error("out of time");
   }
   if (maxi) {
     double value = -INFINITY;
@@ -506,7 +556,7 @@ pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
     if (DEPTH - depth < SORTED) { // sort by heuristic if close to root
       for (size_t i = 0; i < moves.size(); i++) {
         moves_sorted[i] = {moves[i], heur_wrapper(state, moves[i], check[i],
-                                                  mate[i], stalemate[i])};
+                                                  mate[i], stalemate[i], Hash)};
       }
     } else { // else just check forcing first (mates really should go first)
       for (size_t i = 0; i < moves.size(); i++) {
@@ -519,16 +569,21 @@ pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
          [state](const pair<Move, double> &a, const pair<Move, double> &b) {
            return a.sc > b.sc;
          });
-
+    bool cutoff = false;
     for (auto &[m, h] : moves_sorted) {
+      uint64_t new_hash = state.Hash_roll(m, Hash);
+      state.apply_move(m);
       pair<Move, double> new_m =
-          alpha_beta(state.apply_move(m), m, depth - 1, alpha, beta, false);
+          alpha_beta(state, m, depth - 1, alpha, beta, false, new_hash);
+      state.undo_move(m);
       if (new_m.sc > value) {
         value = new_m.sc;
         ans = m;
       }
       alpha = max(alpha, value);
       if (beta <= alpha) {
+        // beta cutoff
+        cutoff = true;
         break;
       }
     }
@@ -537,6 +592,18 @@ pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
          << " as: " << (maxi ? "max " : "min ") << "at depth: " << depth
          << " with heuristic v of: " << value << "\n";
 #endif
+    if (depth != DEPTH and value < 0) {
+      thc::DRAWTYPE res;
+      if (state.board.IsDraw(true, res)) {
+        return {{}, 0};
+      }
+    }
+    if (memory != TT.end() and
+        (memory->sc.value < value or memory->sc.depth < depth)) {
+      memory->second = {ans, value, depth, cutoff ? Lower : Exact};
+    } else {
+      TT[Hash] = {ans, value, depth, cutoff ? Lower : Exact};
+    }
     return {ans, value};
   } else {
     double value = INFINITY;
@@ -550,7 +617,7 @@ pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
     if (DEPTH - depth < SORTED) { // sort by heuristic if close to root
       for (size_t i = 0; i < moves.size(); i++) {
         moves_sorted[i] = {moves[i], heur_wrapper(state, moves[i], check[i],
-                                                  mate[i], stalemate[i])};
+                                                  mate[i], stalemate[i], Hash)};
       }
     } else { // else just check forcing first (mates really should go first)
       for (size_t i = 0; i < moves.size(); i++) {
@@ -563,15 +630,21 @@ pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
          [state](const pair<Move, double> &a, const pair<Move, double> &b) {
            return a.sc < b.sc;
          });
+    bool cutoff = false;
     for (auto &[m, h] : moves_sorted) {
+      uint64_t new_hash = state.Hash_roll(m, Hash);
+      state.apply_move(m);
       pair<Move, double> new_m =
-          alpha_beta(state.apply_move(m), m, depth - 1, alpha, beta, true);
+          alpha_beta(state, m, depth - 1, alpha, beta, true, new_hash);
+      state.undo_move(m);
       if (new_m.sc < value) {
         value = new_m.sc;
         ans = m;
       }
       beta = min(beta, value);
       if (beta <= alpha) {
+        // alpha cutoff
+        cutoff = true;
         break;
       }
     }
@@ -580,23 +653,52 @@ pair<Move, double> alpha_beta(Game state, Move a, int depth, double alpha,
          << " as: " << (maxi ? "max " : "min ") << "at depth: " << depth
          << " with heuristic v of: " << value << "\n";
 #endif
+    if (depth != DEPTH and value > 0) {
+      thc::DRAWTYPE res;
+      if (state.board.IsDraw(false, res)) {
+        return {{}, 0};
+      }
+    }
+    if (memory != TT.end() and
+        (memory->sc.value > value or memory->sc.depth < depth)) {
+      memory->second = {ans, value, depth, cutoff ? Lower : Exact};
+    } else {
+      TT[Hash] = {ans, value, depth, cutoff ? Lower : Exact};
+    }
     return {ans, value};
   }
 }
 
 Move run_alpha_beta(Game state) {
-#if T_MOVE
-  chrono::time_point<chrono::system_clock> start, end;
+  for (auto it = TT.begin(); it != TT.end();) {
+    if (it->sc.history >= 8) {
+      it = TT.erase(it);
+    } else {
+      (it++)->sc.history++;
+    }
+  }
   start = chrono::system_clock::now();
+  uint64_t Hash = state.Hash();
+  auto ans = alpha_beta(state, {}, 2, -INFINITY, INFINITY,
+                        state.board.WhiteToPlay(), Hash);
+  auto T = chrono::system_clock::now();
+  for (int depth = 3;
+       chrono::duration_cast<chrono::milliseconds>(T - start) < per_move;
+       depth++, T = chrono::system_clock::now()) {
+    DEPTH = depth;
+    try {
+      ans = alpha_beta(state, {}, depth, -INFINITY, INFINITY,
+                       state.board.WhiteToPlay(), Hash);
+    } catch (runtime_error A) {
+      break;
+    }
+#if VERBOSE
+    cout << "choosen " << ans.fi->NaturalOut(&state.board)
+                        << " at depth: " << depth
+                        << " with value of: " << ans.sc << endl;
 #endif
-  auto ans = alpha_beta(state, {}, DEPTH, -INFINITY, INFINITY,
-                        state.board.WhiteToPlay())
-                 .fi;
-#if T_MOVE
-  end = chrono::system_clock::now();
-  cerr << chrono::duration_cast<chrono::milliseconds>(end - start) << "\n";
-#endif
-  return ans;
+  }
+  return ans.fi;
 }
 
 void print_result(Game &state) {
@@ -622,8 +724,7 @@ int main() {
   if (fen) {
     cout << "fen:\n";
     string fen_in;
-    cin.clear();
-    fflush(stdin);
+    cin >> ws;
     getline(cin, fen_in);
     state.board.Forsyth(fen_in.c_str());
   }
@@ -634,11 +735,17 @@ int main() {
   string choice;
   cin >> choice;
   transform(choice.begin(), choice.end(), choice.begin(), ::tolower);
+  float seconds_per_move;
+  cout << "Seconds per move? ";
+  cin >> seconds_per_move;
+  per_move =
+      round<chrono::milliseconds>(chrono::duration<float>{seconds_per_move});
   while (state.terminal() == thc::NOT_TERMINAL) {
     string m;
     bool ok;
     thc::Move mv;
-    if (choice == "b") {
+    if ((choice == "b" and state.board.WhiteToPlay()) or
+        (choice == "w" and !state.board.WhiteToPlay())) {
       choice.clear();
       goto black;
     }
@@ -647,7 +754,7 @@ int main() {
       cin >> m;
       ok = mv.NaturalIn(&state.board, m.c_str());
     } while (not ok);
-    state = state.apply_move({mv});
+    state.apply_move_no_undo({mv});
   black:
     if (not mo)
       state.print();
@@ -657,7 +764,7 @@ int main() {
     Move b = run_alpha_beta(state);
     if (b) {
       cout << b.value().NaturalOut(&state.board) << "\n";
-      state = state.apply_move({b.value()});
+      state.apply_move_no_undo(b);
     } else {
       cerr << "Fin?\n";
     }
