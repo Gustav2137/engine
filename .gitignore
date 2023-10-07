@@ -4,3 +4,4 @@ thc.h
 thc.cpp
 *.o
 *.txt
+engine
